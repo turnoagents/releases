@@ -1,0 +1,209 @@
+# O Turno no Mac de uma pessoa, numa imagem só (#395).
+#
+# A MESMA IMAGEM DA PRODUÇÃO. Este compose não constrói nada: `server` e `worker` são a imagem
+# publicada `ghcr.io/turnoagents/turno-server`, a mesma que a produção roda, e o app, a API, o
+# computer e o runtime do Hermes vêm todos dentro dela.
+#
+# O QUE ELE NÃO TEM, E POR QUÊ. O `agent-computer`, o `hermes`, o `spire-*`, o `supervisor` e os
+# `agent-*` da instalação antiga somem: o computer e o Hermes estão dentro da imagem (o s6 do
+# container sobe o computer em loopback e o runtime do Hermes em `/opt/turno/hermes-runtime`), o
+# supervisor precisa do socket do Docker e não existe nesta forma, e o assistente pessoal corre
+# dentro do servidor.
+#
+# OS NOMES SÃO OS DE ANTES, DE PROPÓSITO (`server`, `worker`, `migrate`, `postgres`): o app do
+# desktop sobe e para esses serviços pelo nome, e o `predates_containers` do
+# `desktop/src-tauri/src/deployment.rs:292` reconhece a forma pelos `server` e `worker`. Um compose
+# com nomes novos seria tratado como release pré-containers.
+#
+# O BANCO É O DE FORA, com os dados que já existem no Mac: `EMBEDDED_POSTGRES=off`. É por isso que
+# a migração é o serviço `migrate` e não o `migrate` do s6 — com banco externo ele sai sem migrar
+# (`docker/s6/scripts/migrate.sh:9`).
+name: turno-desktop
+
+# ANCHORS DO YAML, NÃO SERVIÇOS. O env é um mapa compartilhado por `server` e `worker` com `*`:
+# `extends` teria materializado um serviço (`x-shared-env` subia como container, e aparecia em
+# `compose up`). Um anchor fora de `services:` não é serviço para o Compose.
+x-shared-environment: &shared-environment
+    EMBEDDED_POSTGRES: "off"
+    EMBEDDED_COMPUTER: "on"
+    PORT: "3001"
+    SERVER_PORT: "3001"
+    TENANT_PACKAGE_DIR: /app/examples/empresa
+    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    AGENT_COMPUTER_URL: ${AGENT_COMPUTER_CONTAINER_URL:-http://127.0.0.1:4100}
+    HERMES_BASE_URL: ""
+    MANAGED_AGENT_AG_UI_URL: ""
+    COMPUTER_SUPERVISOR_URL: ""
+    HERMES_BRIDGE_HOST: 127.0.0.1
+    HERMES_MCP_TOKEN: ${HERMES_MCP_TOKEN:-${MANAGED_AGENT_TOKEN:-}}
+    AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS: ""
+    OPENBOT_TOOL_URL: http://127.0.0.1:3001/api/agent-tools/call
+    OPENBOT_EDITION: ${OPENBOT_EDITION:-personal}
+    OPENBOT_SINGLE_USER: ${OPENBOT_SINGLE_USER:-true}
+    OPENBOT_PERSISTENCE: ${OPENBOT_PERSISTENCE:-postgres}
+
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    # O mesmo nome de volume da instalação antiga: o banco e os dados ficam onde estão.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: openbot
+      POSTGRES_USER: openbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?the database password belongs in .env}
+    ports:
+      # Loopback, e as duas famílias de endereço porque `localhost` não é um endereço só: um cliente
+      # que recebe ::1 primeiro não cai para 127.0.0.1, ele falha.
+      - "127.0.0.1:${POSTGRES_PORT:-5652}:5432"
+      - "[::1]:${POSTGRES_PORT:-5652}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openbot -d openbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - data
+
+  # A migração, uma vez por release. A mesma imagem, com o `working_dir` que o servidor usa.
+  # Roda até o fim e não é serviço de longa duração, então não tem `restart`.
+  #
+  # `entrypoint` EXPLÍCITO, E NÃO SÓ O `command`. O `ENTRYPOINT` da imagem é `/init`, o do s6, que
+  # sobe todos os serviços e não executa o `command` — um `migrate` só com `command:` subiu o s6
+  # inteiro e morreu sem migrar ("DATABASE_URL must be configured", no log do ensaio). Trocar o
+  # entrypoint por um shell é o que faz o container ser *só* a migração.
+  migrate:
+    image: ${SERVER_IMAGE:-ghcr.io/turnoagents/turno-server:beta}
+    pull_policy: ${IMAGE_PULL_POLICY:-missing}
+    entrypoint: ["/bin/sh", "-c"]
+    # UM ARGUMENTO SÓ, E É O SCRIPT DO `sh -c`. Sem isso o `sh` recebe `bun` como o próprio script e
+    # `scripts/migrate.ts` como `$0`: o Bun imprime o help e sai 0, sem migrar, e o servidor sobe
+    # contra um banco sem as colunas novas (`column "run_limit_micro_usd" does not exist`, 500 em
+    # `/api/usage/me`). Medido no ensaio.
+    #
+    # O `cd` é o caminho porque o `working_dir` da imagem é `/app` e não chegou a este serviço.
+    command: ["cd /app/server && bun scripts/migrate.ts"]
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      # O banco é o de fora: o s6 não migra por conta própria neste modo.
+      EMBEDDED_POSTGRES: "off"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - agent-workspace:/workspace
+      - agent-profiles:/profiles
+      - hermes-home:/opt/data
+    networks:
+      - data
+
+  # A API e o app que ela serve. O único serviço de longa duração.
+  server:
+    image: ${SERVER_IMAGE:-ghcr.io/turnoagents/turno-server:beta}
+    pull_policy: ${IMAGE_PULL_POLICY:-missing}
+    restart: unless-stopped
+    # O arquivo do deployment, e o mapa compartilhado acima. `environment:` vence cada chave que o
+    # arquivo repete: é assim que os endereços de serviços que sumiram são zerados, e como o
+    # `AGENT_COMPUTER_URL` do arquivo (a porta do host) é trocado pelo loopback do container.
+    env_file:
+      - path: ./.env
+        required: false
+    environment: *shared-environment
+    ports:
+      # 3601 é a porta que o shell verifica; 3610 é a do app. Ambas em loopback: é o Mac de uma
+      # pessoa, e o modo single-user só é admitido sem um endereço que a internet alcance.
+      - "127.0.0.1:${SERVER_PORT:-3601}:3001"
+      - "[::1]:${SERVER_PORT:-3601}:3001"
+      - "127.0.0.1:${APP_PORT:-3610}:3001"
+      - "[::1]:${APP_PORT:-3610}:3001"
+    volumes:
+      # Os três diretórios que têm de sobreviver a um recreate. O `turno-data` do Postgres embutido
+      # não está aqui porque o banco é o de fora, acima.
+      # OS VOLUMES TÊM OS NOMES DA INSTALAÇÃO ANTIGA (#395). Os dados do Mac do CEO estão em
+      # `agent-workspace`, `agent-profiles` e `hermes-home`, e um compose que os renomeasse abriria
+      # um conjunto vazio: as conversas e os arquivos de trabalho sumiriam, e as contas de IA
+      # (`hermes-home/model-accounts`: os planos Claude e CommandCode) apareceriam como
+      # desconectadas, porque o servidor as lê de `/opt/data/model-accounts`.
+      - agent-workspace:/workspace
+      - agent-profiles:/profiles
+      # O VOLUME DO CEO É DO UID 1001, E O SERVIDOR DA IMAGEM É 1002 (#395). A instalação antiga
+      # rodava o server como `user: 1001:1001`, que é o dono destes três; a imagem de container único
+      # quer root no `/init` (o s6 precisa dele para montar os serviços) e cai para `apiuser` (1002)
+      # no processo da API. Com o volume em 1001 o servidor não lê o pool — `EACCES:
+      # /opt/data/config.yaml.tmp` — e a tela de IA diz "não consegui carregar as contas".
+      #
+      # `install -d` sem `-o` preserva o dono que já existe, então o `model-accounts-home.sh` da
+      # imagem não conserta isto. Quem conserta é este serviço, uma vez por start, como root que
+      # ainda é: os dois diretórios que a API escreve passam a ser do apiuser, e o resto do volume
+      # fica como está (os homes por conta são lidos, não reescritos).
+      - hermes-home:/opt/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        # Um block scalar: o `? :` do script terminaria um scalar YAML simples no ` : `.
+        - >-
+          bun -e "const r = await fetch('http://127.0.0.1:3001/health'); process.exit(r.ok ? 0 : 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # As migrações vêm antes, mas o primeiro initdb de um volume novo precisa de folga.
+      start_period: 120s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+
+  # O sweep das rotinas, da mesma imagem: o laço que a instalação antiga rodava de
+  # `worker/src/index.ts`. Aqui ele chama o script que já existe na imagem, a cada minuto.
+  #
+  # SEM `|| true` E SEM SEGREDO: um sweep que falha devolve não-zero e o `while` tenta de novo; o
+  # `sleep` é o intervalo. O `restart: unless-stopped` cobre o laço que morrer de todo.
+  worker:
+    image: ${SERVER_IMAGE:-ghcr.io/turnoagents/turno-server:beta}
+    pull_policy: ${IMAGE_PULL_POLICY:-missing}
+    restart: unless-stopped
+    env_file:
+      - path: ./.env
+        required: false
+    working_dir: /app/server
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "while :; do bun scripts/fire-routines.ts || true; sleep 60; done"
+    environment:
+      # O mapa do server, mais os dois que são só do sweep. `<<` funde os dois: repetir
+      # `environment` substituiria o mapa inteiro, e o worker reprovaria no `HERMES_PROFILES_HOME`.
+      <<: *shared-environment
+      SERVER_INTERNAL_URL: http://server:3001
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:?set WORKER_SHARED_SECRET in .env}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      server:
+        condition: service_started
+    networks:
+      # Só a rede do banco e do servidor. O que um Bot alcança não alcança este.
+      - data
+
+volumes:
+  # O MESMO nome da instalação antiga, para o upgrade não mover dado nenhum. `external: false` e um
+  # nome explícito: um volume nomeado pelo projeto seria `turno-desktop_postgres-data` e o antigo
+  # já é o do projeto `turno-desktop`.
+  postgres-data:
+  # SEM `name:` EXPLÍCITO, e é a correção do incidente de 22/11. O projeto é sempre `turno-desktop`
+  # (`stack.rs:3437` `DESKTOP_PROJECT`, e `.openbot-project.json` no Mac confirma), então o nome
+  # padrão do Compose já é `turno-desktop_agent-workspace` e companhia: os volumes certos, sem uma
+  # linha que os fixe. Com `name:` fixo, um projeto de teste (`-p ensaio`) escrevia nos volumes de
+  # verdade — foi assim que um ensaio meu mudou o dono do volume do CEO.
+  agent-workspace:
+  agent-profiles:
+  hermes-home:
+
+networks:
+  data:
