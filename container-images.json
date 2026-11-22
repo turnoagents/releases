@@ -1,8 +1,8 @@
 {
-  "version": "v1.1.0-beta.7",
+  "version": "v1.1.0-beta.8",
   "images": {
     "server": {
-      "reference": "ghcr.io/turnoagents/turno-server:1.1.0-beta.5@sha256:7ef0952591083bc6cbb31c596124737db6ade00b87d6b899593397a14fb04324"
+      "reference": "ghcr.io/turnoagents/turno-server:1.1.0-beta.8@sha256:dfa1bb89cdc48de046beba37649257a7dcc7880b2fc8078855364a55c827fec0"
     },
     "agent-computer": {
       "reference": "busybox:1.37"
