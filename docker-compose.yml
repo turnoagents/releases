@@ -23,13 +23,17 @@ name: turno-desktop
 # ANCHORS DO YAML, NÃO SERVIÇOS. O env é um mapa compartilhado por `server` e `worker` com `*`:
 # `extends` teria materializado um serviço (`x-shared-env` subia como container, e aparecia em
 # `compose up`). Um anchor fora de `services:` não é serviço para o Compose.
+# O BANCO É O MESMO DA v1.0.1, E A URL TAMBÉM (#395, 22/11). O `.env` do Mac traz um DATABASE_URL para
+# o host (127.0.0.1:5652), que dentro do container aponta para o próprio container; e não traz
+# POSTGRES_PASSWORD. O compose da v1.0.1 fixava a mesma senha e a URL da rede do Compose; este faz
+# igual, para abrir com o `.env` que um Mac já tem. A porta do banco só escuta em loopback.
 x-shared-environment: &shared-environment
     EMBEDDED_POSTGRES: "off"
     EMBEDDED_COMPUTER: "on"
     PORT: "3001"
     SERVER_PORT: "3001"
     TENANT_PACKAGE_DIR: /app/examples/empresa
-    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    DATABASE_URL: postgres://openbot:openbot@postgres:5432/openbot
     AGENT_COMPUTER_URL: ${AGENT_COMPUTER_CONTAINER_URL:-http://127.0.0.1:4100}
     HERMES_BASE_URL: ""
     MANAGED_AGENT_AG_UI_URL: ""
@@ -41,6 +45,26 @@ x-shared-environment: &shared-environment
     OPENBOT_EDITION: ${OPENBOT_EDITION:-personal}
     OPENBOT_SINGLE_USER: ${OPENBOT_SINGLE_USER:-true}
     OPENBOT_PERSISTENCE: ${OPENBOT_PERSISTENCE:-postgres}
+    # OS SEGREDOS E AS CHAVES, COMO A v1.0.1 OS PASSAVA (#395, 22/11). Eles não estão no `.env`: o app os
+    # exporta de `.secrets/` ao rodar o Compose. Sem esta lista o servidor subia sem
+    # KEY_ENCRYPTION_KEY (não sobe, e as credenciais guardadas não se leem), sem o token das pastas
+    # do Mac e sem as chaves de modelo. Mesmos nomes e mesmos padrões do compose da v1.0.1.
+    AGENT_TOOL_TOKEN: ${AGENT_TOOL_TOKEN:-}
+    COMPUTER_TOKEN: ${COMPUTER_TOKEN:-openbot-dev-computer-token}
+    KEY_ENCRYPTION_KEY: ${KEY_ENCRYPTION_KEY:-}
+    MANAGED_AGENT_TOKEN: ${MANAGED_AGENT_TOKEN:-}
+    SUPERVISOR_TOKEN: ${SUPERVISOR_TOKEN:-openbot-dev-supervisor-token}
+    WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:-openbot-dev-worker-secret}
+    OPENBOT_LEARNING_MODEL_TOKEN: ${LEARNING_MODEL_TOKEN:-}
+    OPENBOT_DESKTOP_HOST_TOKEN: ${OPENBOT_DESKTOP_HOST_TOKEN:-}
+    OPENBOT_THIS_MACHINE_HOST: ${OPENBOT_THIS_MACHINE_CONTAINER_HOST:-}
+    HERMES_API_KEY: ${HERMES_API_KEY:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+    COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+    ARCADE_API_KEY: ${ARCADE_API_KEY:-}
+    OPENBOT_BROKER_PROVIDER: ${OPENBOT_BROKER_PROVIDER:-}
 
 
 services:
@@ -53,7 +77,7 @@ services:
     environment:
       POSTGRES_DB: openbot
       POSTGRES_USER: openbot
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?the database password belongs in .env}
+      POSTGRES_PASSWORD: openbot
     ports:
       # Loopback, e as duas famílias de endereço porque `localhost` não é um endereço só: um cliente
       # que recebe ::1 primeiro não cai para 127.0.0.1, ele falha.
@@ -91,7 +115,7 @@ services:
     environment:
       # O banco é o de fora: o s6 não migra por conta própria neste modo.
       EMBEDDED_POSTGRES: "off"
-      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      DATABASE_URL: postgres://openbot:openbot@postgres:5432/openbot
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,7 +205,7 @@ services:
       # `environment` substituiria o mapa inteiro, e o worker reprovaria no `HERMES_PROFILES_HOME`.
       <<: *shared-environment
       SERVER_INTERNAL_URL: http://server:3001
-      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:?set WORKER_SHARED_SECRET in .env}
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:-openbot-dev-worker-secret}
     depends_on:
       migrate:
         condition: service_completed_successfully
